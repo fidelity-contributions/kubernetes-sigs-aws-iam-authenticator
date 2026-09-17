@@ -276,6 +276,8 @@ func TestVerifyTokenPreSTSValidations(t *testing.T) {
 	b := make([]byte, maxTokenLenBytes+1)
 	s := string(b)
 	validationErrorTest(t, "aws", s, "token is too large")
+	// One byte shorter is not too large, so it reaches the prefix check.
+	validationErrorTest(t, "aws", s[:maxTokenLenBytes], "token is missing expected \"k8s-aws-v1.\" prefix")
 	validationErrorTest(t, "aws", "k8s-aws-v2.asdfasdfa", "token is missing expected \"k8s-aws-v1.\" prefix")
 	validationErrorTest(t, "aws", "k8s-aws-v1.decodingerror", "illegal base64 data")
 
@@ -298,6 +300,55 @@ func TestVerifyTokenPreSTSValidations(t *testing.T) {
 	validationSuccessTest(t, "aws", toToken(fmt.Sprintf("https://sts.eu-west-1.amazonaws.com/?action=GetCallerIdentity&x-amz-signedheaders=x-k8s-aws-id&x-amz-date=%s&x-amz-expires=60", timeStr)))
 	validationSuccessTest(t, "aws", toToken(fmt.Sprintf("https://sts.sa-east-1.amazonaws.com/?action=GetCallerIdentity&x-amz-signedheaders=x-k8s-aws-id&x-amz-date=%s&x-amz-expires=60", timeStr)))
 	validationErrorTest(t, "aws", toToken(fmt.Sprintf("https://sts.us-west-2.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=ASIAAAAAAAAAAAAAAAAA%%2F20220601%%2Fus-west-2%%2Fsts%%2Faws4_request&X-Amz-Date=%s&X-Amz-Expires=900&X-Amz-Security-Token=XXXXXXXXXXXXX&X-Amz-SignedHeaders=host%%3Bx-k8s-aws-id&x-amz-credential=eve&X-Amz-Signature=999999999999999999", timeStr)), "input token was not properly formatted: duplicate query parameter found:")
+}
+
+func TestVerifyLargeSessionTokens(t *testing.T) {
+	cases := []struct {
+		name            string
+		sessionTokenLen int
+	}{
+		{"current STS session token limit", 4096},
+		{"headroom for a future 8KB session token", 8192},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			token := tokenWithSessionTokenLen(t, tc.sessionTokenLen)
+			if len(token) > maxTokenLenBytes {
+				t.Fatalf("token for a %d byte session token is %d bytes, which exceeds maxTokenLenBytes of %d",
+					tc.sessionTokenLen, len(token), maxTokenLenBytes)
+			}
+			t.Logf("session token %d bytes -> token %d bytes (%d bytes under maxTokenLenBytes)",
+				tc.sessionTokenLen, len(token), maxTokenLenBytes-len(token))
+			validationSuccessTest(t, "aws", token)
+		})
+	}
+}
+
+// tokenWithSessionTokenLen returns a token for a caller whose STS session token is
+// sessionTokenLen bytes.
+func tokenWithSessionTokenLen(t *testing.T, sessionTokenLen int) string {
+	t.Helper()
+
+	// STS session tokens are base64, whose "+" and "/" characters cost three bytes each
+	// once percent-encoded into the pre-signed URL.
+	raw := make([]byte, sessionTokenLen)
+	for i := range raw {
+		raw[i] = byte(i)
+	}
+	sessionToken := base64.StdEncoding.EncodeToString(raw)[:sessionTokenLen]
+
+	cfg := aws.Config{
+		Region:      "us-west-2",
+		Credentials: credentials.NewStaticCredentialsProvider("AKID", "SECRET", sessionToken),
+	}
+
+	gen := &generator{nowFunc: func() time.Time { return now }}
+	token, err := gen.GetWithSTS("test-cluster", sts.NewFromConfig(cfg))
+	if err != nil {
+		t.Fatalf("Error generating token: %v", err)
+	}
+	return token.Token
 }
 
 func TestVerifyHTTPThrottling(t *testing.T) {
